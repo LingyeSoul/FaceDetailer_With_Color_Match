@@ -16,7 +16,20 @@ def _resolve_face_detailer_class():
     return face_detailer_class
 
 
-def _color_match_batch(image_ref, image_target, method, strength=1.0, multithread=True):
+def _get_mask_bbox(mask_2d, threshold=1e-4):
+    active = mask_2d > threshold
+    if not torch.any(active):
+        return None
+
+    coords = torch.nonzero(active, as_tuple=False)
+    y0 = int(coords[:, 0].min().item())
+    y1 = int(coords[:, 0].max().item()) + 1
+    x0 = int(coords[:, 1].min().item())
+    x1 = int(coords[:, 1].max().item()) + 1
+    return y0, y1, x0, x1
+
+
+def _color_match_batch(image_ref, image_target, method, strength=1.0, multithread=True, mask=None):
     try:
         from color_matcher import ColorMatcher
     except Exception as exc:
@@ -26,24 +39,56 @@ def _color_match_batch(image_ref, image_target, method, strength=1.0, multithrea
 
     image_ref = image_ref.cpu()
     image_target = image_target.cpu()
+    if mask is not None:
+        mask = _align_mask_to_image(mask.cpu(), image_target)
+
     batch_size = image_target.size(0)
 
-    images_target = image_target.squeeze()
-    images_ref = image_ref.squeeze()
+    if image_ref.size(0) not in (1, batch_size):
+        raise Exception("参考图 batch 大小必须为 1 或与目标图一致")
 
-    image_ref_np = images_ref.numpy()
-    images_target_np = images_target.numpy()
+    if mask is not None and mask.size(0) not in (1, batch_size):
+        raise Exception("mask batch 大小必须为 1 或与目标图一致")
 
     def process(i):
         cm = ColorMatcher()
-        image_target_np_i = images_target_np if batch_size == 1 else images_target[i].numpy()
-        image_ref_np_i = image_ref_np if image_ref.size(0) == 1 else images_ref[i].numpy()
+        image_target_i = image_target[0] if image_target.size(0) == 1 else image_target[i]
+        image_ref_i = image_ref[0] if image_ref.size(0) == 1 else image_ref[i]
+
+        if mask is None:
+            image_target_np_i = image_target_i.numpy().copy()
+            image_ref_np_i = image_ref_i.numpy().copy()
+            try:
+                image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method)
+                image_result = image_target_np_i + strength * (image_result - image_target_np_i)
+                return torch.from_numpy(image_result)
+            except Exception:
+                return image_target_i
+
+        mask_i = mask[0] if mask.size(0) == 1 else mask[i]
+        mask_2d = mask_i[..., 0]
+        bbox = _get_mask_bbox(mask_2d)
+        if bbox is None:
+            return image_target_i
+
+        y0, y1, x0, x1 = bbox
+        image_target_crop = image_target_i[y0:y1, x0:x1, :]
+        image_ref_crop = image_ref_i[y0:y1, x0:x1, :]
+        mask_crop = mask_i[y0:y1, x0:x1, :]
+
+        image_target_np_i = image_target_crop.numpy().copy()
+        image_ref_np_i = image_ref_crop.numpy().copy()
         try:
             image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method)
             image_result = image_target_np_i + strength * (image_result - image_target_np_i)
-            return torch.from_numpy(image_result)
+            image_result = torch.from_numpy(image_result).to(torch.float32)
         except Exception:
-            return torch.from_numpy(image_target_np_i)
+            image_result = image_target_crop
+
+        blended = image_target_i.clone()
+        blended_crop = image_target_crop * (1.0 - mask_crop) + image_result * mask_crop
+        blended[y0:y1, x0:x1, :] = blended_crop
+        return blended
 
     if multithread and batch_size > 1:
         max_threads = min(os.cpu_count() or 1, batch_size)
@@ -106,7 +151,7 @@ class FaceDetailerColorMatch:
     CATEGORY = "ImpactPack/Simple"
     DESCRIPTION = (
         "基于 FaceDetailer 完整流程，完成遮罩区域重绘后，\n"
-        "可将结果与原图进行 Color Match，并按同一遮罩区域回贴。"
+        "仅对遮罩对应区域做 Color Match，并按同一遮罩区域回贴。"
     )
 
     def doit(
@@ -207,13 +252,10 @@ class FaceDetailerColorMatch:
                 method=color_match_method,
                 strength=color_match_strength,
                 multithread=color_match_multithread,
+                mask=result_mask,
             )
             matched = matched.to(device=result_img.device, dtype=result_img.dtype)
-
-            mask = _align_mask_to_image(result_mask, result_img)
-
-            result_img = result_img * (1.0 - mask) + matched * mask
-            result_img = result_img.clamp(0.0, 1.0)
+            result_img = matched.clamp(0.0, 1.0)
 
         return (
             result_img,

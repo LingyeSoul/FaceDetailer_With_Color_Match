@@ -2,8 +2,8 @@
 
 把 Impact-Pack 的 `FaceDetailer` 与 KJNodes 的 `Color Match` 串成一个新节点：
 - 先执行 FaceDetailer 的完整遮罩检测/重绘流程
-- 再将重绘结果与原图做 Color Match
-- 最后按 FaceDetailer 产出的 `mask` 回贴（仅影响重绘区域）
+- 再仅针对 FaceDetailer 产出的 `mask` 有效区域做 Color Match
+- 最后只在该遮罩区域回贴，减少整图统计带来的偏色
 
 ## 依赖
 - `ComfyUI-Impact-Pack`（必须，提供 FaceDetailer）
@@ -28,4 +28,4 @@
 
 ## 行为说明
 - `apply_color_match = disabled`：行为与原 FaceDetailer 保持一致
-- `apply_color_match = enabled`：对 FaceDetailer 输出图执行 Color Match（参考图=原图），并按 `mask` 回贴到重绘区域
+- `apply_color_match = enabled`：对 FaceDetailer 输出图在 `mask` 对应的局部区域执行 Color Match（参考图=原图同区域），并仅在该区域回贴
